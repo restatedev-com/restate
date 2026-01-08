@@ -31,6 +31,7 @@ use url::Url;
 
 use restate_clock::WallClock;
 use restate_core::Metadata;
+use restate_metadata_server::MetadataStoreClient;
 use restate_object_store_util::create_object_store_client;
 use restate_types::config::SnapshotsOptions;
 use restate_types::identifiers::{PartitionId, SnapshotId};
@@ -38,7 +39,30 @@ use restate_types::logs::{LogId, Lsn};
 use restate_types::nodes_config::ClusterFingerprint;
 use restate_types::time::MillisSinceEpoch;
 
+#[cfg(any(test, feature = "test-util"))]
+use super::leases::NoOpLeaseManager;
+use super::leases::{LeaseError, SnapshotLeaseGuard, SnapshotLeaseManager};
 use super::{LocalPartitionSnapshot, PartitionSnapshotMetadata, SnapshotFormatVersion};
+
+#[derive(Clone)]
+pub enum LeaseProvider {
+    Real(SnapshotLeaseManager),
+    #[cfg(any(test, feature = "test-util"))]
+    NoOp(NoOpLeaseManager),
+}
+
+impl LeaseProvider {
+    pub async fn acquire(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<SnapshotLeaseGuard, super::leases::LeaseError> {
+        match self {
+            Self::Real(m) => m.acquire(partition_id).await,
+            #[cfg(any(test, feature = "test-util"))]
+            Self::NoOp(m) => m.acquire(partition_id).await,
+        }
+    }
+}
 
 /// Provides read and write access to the long-term partition snapshot storage destination.
 ///
@@ -61,6 +85,7 @@ pub struct SnapshotRepository {
     prefix: ObjectPath,
     staging_dir: PathBuf,
     num_retained: std::num::NonZeroU8,
+    lease_provider: Option<LeaseProvider>,
     #[cfg(any(test, feature = "test-util"))]
     enable_cleanup: bool,
 }
@@ -298,10 +323,27 @@ impl UniqueSnapshotKey {
 }
 
 impl SnapshotRepository {
-    /// Creates an instance of the repository if a snapshots destination is configured.
+    /// Creates a writable repository with a default metadata-backed lease manager
     pub async fn new_from_config(
         snapshots_options: &SnapshotsOptions,
         staging_dir: PathBuf,
+        metadata_store_client: MetadataStoreClient,
+    ) -> anyhow::Result<Option<SnapshotRepository>> {
+        Self::new_internal(snapshots_options, staging_dir, Some(metadata_store_client)).await
+    }
+
+    /// Creates a repository without a lease manager; can not be used to upload snapshots
+    pub async fn new_read_only_from_config(
+        snapshots_options: &SnapshotsOptions,
+        staging_dir: PathBuf,
+    ) -> anyhow::Result<Option<SnapshotRepository>> {
+        Self::new_internal(snapshots_options, staging_dir, None).await
+    }
+
+    async fn new_internal(
+        snapshots_options: &SnapshotsOptions,
+        staging_dir: PathBuf,
+        metadata_store_client: Option<MetadataStoreClient>,
     ) -> anyhow::Result<Option<SnapshotRepository>> {
         let mut destination = if let Some(ref destination) = snapshots_options.destination {
             Url::parse(destination).context("Failed parsing snapshot repository URL")?
@@ -322,6 +364,9 @@ impl SnapshotRepository {
         )
         .await?;
 
+        let lease_provider = metadata_store_client
+            .map(|client| LeaseProvider::Real(SnapshotLeaseManager::new(client)));
+
         Ok(Some(SnapshotRepository {
             object_store,
             destination,
@@ -330,13 +375,69 @@ impl SnapshotRepository {
             num_retained: snapshots_options.num_retained,
             #[cfg(any(test, feature = "test-util"))]
             enable_cleanup: snapshots_options.enable_cleanup,
+            lease_provider,
         }))
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn new_from_config_with_stub_leases(
+        snapshots_options: &SnapshotsOptions,
+        staging_dir: PathBuf,
+    ) -> anyhow::Result<Option<SnapshotRepository>> {
+        let mut destination = if let Some(ref destination) = snapshots_options.destination {
+            Url::parse(destination).context("Failed parsing snapshot repository URL")?
+        } else {
+            return Ok(None);
+        };
+        destination
+            .query()
+            .inspect(|params| info!("Snapshot destination parameters ignored: {params}"));
+        destination.set_query(None);
+
+        let prefix = destination.path().to_string();
+        let object_store = create_object_store_client(
+            destination.clone(),
+            &snapshots_options.object_store,
+            &snapshots_options.object_store_retry_policy,
+        )
+        .await?;
+
+        Ok(Some(SnapshotRepository {
+            object_store,
+            destination,
+            prefix: ObjectPath::from(prefix),
+            staging_dir,
+            num_retained: snapshots_options.num_retained,
+            enable_cleanup: snapshots_options.enable_cleanup,
+            lease_provider: Some(LeaseProvider::NoOp(NoOpLeaseManager::new())),
+        }))
+    }
+
+    /// Acquire a lease for snapshot operations on this partition
+    ///
+    /// On success, returns a guard with background renewal already started. The guard should be
+    /// held for the duration of snapshot operations and passed to `put`.
+    ///
+    /// Returns `LeaseError::Unavailable` if the repository was created without a lease provider.
+    pub async fn acquire_lease(
+        &self,
+        partition_id: PartitionId,
+    ) -> Result<Arc<SnapshotLeaseGuard>, LeaseError> {
+        let provider = self
+            .lease_provider
+            .as_ref()
+            .ok_or(LeaseError::Unavailable)?;
+        let guard = provider.acquire(partition_id).await?;
+        let guard = Arc::new(guard);
+        guard.start_renewal_task()?;
+        Ok(guard)
     }
 
     /// Write a partition snapshot to the snapshot repository
     ///
     /// Returns the latest snapshot status on successful upload. Depending on retention settings,
-    /// the archived LSN may be earlier than that of the snapshot which was just uploaded.
+    /// the archived LSN may be earlier than that of the snapshot which was just uploaded. This
+    /// operation requires a valid lease obtained by calling `acquire_lease`.
     #[instrument(
         level = "error",
         err,
@@ -347,6 +448,7 @@ impl SnapshotRepository {
         &self,
         snapshot: &PartitionSnapshotMetadata,
         local_snapshot_path: PathBuf,
+        lease_guard: Arc<SnapshotLeaseGuard>,
     ) -> anyhow::Result<PartitionSnapshotStatus> {
         use crate::metric_definitions::{
             SNAPSHOT_UPLOAD_DURATION, SNAPSHOT_UPLOAD_FAILED, SNAPSHOT_UPLOAD_SUCCESS,
@@ -356,7 +458,7 @@ impl SnapshotRepository {
 
         let start = tokio::time::Instant::now();
         let put_result = self
-            .put_snapshot_inner(snapshot, local_snapshot_path.as_path())
+            .put_snapshot_inner(snapshot, local_snapshot_path.as_path(), lease_guard)
             .await;
 
         // We only log the error here since (a) it's relatively unlikely for rmdir to fail, and (b)
@@ -394,6 +496,7 @@ impl SnapshotRepository {
         &self,
         snapshot: &PartitionSnapshotMetadata,
         local_snapshot_path: &Path,
+        lease_guard: Arc<SnapshotLeaseGuard>,
     ) -> Result<PartitionSnapshotStatus, PutSnapshotError> {
         let snapshot_prefix = self.base_prefix(snapshot);
         debug!(
@@ -407,39 +510,10 @@ impl SnapshotRepository {
             .await?;
 
         let latest_path = self.latest_snapshot_pointer_path(snapshot.partition_id);
-
         let maybe_stored = self
             .get_latest_snapshot_metadata_for_update(&latest_path)
             .await
             .map_err(|e| PutSnapshotError::from(e, progress.clone()))?;
-
-        if let Some((latest_stored, _)) = &maybe_stored
-            && latest_stored.min_applied_lsn >= snapshot.min_applied_lsn
-        {
-            info!(
-                repository_latest_lsn = ?latest_stored.min_applied_lsn,
-                new_snapshot_lsn = ?snapshot.min_applied_lsn,
-                "The newly uploaded snapshot is no newer than the already-stored latest snapshot, \
-                will not update latest pointer"
-            );
-
-            let snapshot_ref = SnapshotReference::from_metadata(snapshot);
-            let partition_id = snapshot.partition_id;
-            let repository = self.clone();
-            let _ = restate_core::TaskCenter::spawn_unmanaged_child(
-                restate_core::TaskKind::Disposable,
-                "snapshot-cleanup-superseded",
-                async move {
-                    repository
-                        .delete_snapshot_files(partition_id, &snapshot_ref)
-                        .await;
-                    Ok::<(), anyhow::Error>(())
-                },
-            );
-
-            return PartitionSnapshotStatus::try_from(latest_stored)
-                .map_err(|e| PutSnapshotError::from(e, progress.clone()));
-        }
 
         let (new_latest, evicted_snapshots) = self
             .build_latest_v2(snapshot, maybe_stored.as_ref().map(|(l, _)| l))
@@ -450,9 +524,7 @@ impl SnapshotRepository {
                 .map_err(|e| PutSnapshotError::from(e, progress.clone()))?,
         );
 
-        let conditions =
-            self.conditional_put_options(maybe_stored.as_ref().map(|(_, version)| version));
-
+        let conditions = self.conditional_put_options(maybe_stored.map(|(_, v)| v));
         let put_result = self
             .object_store
             .put_opts(&latest_path, latest_payload, conditions)
@@ -471,7 +543,7 @@ impl SnapshotRepository {
         let enable_cleanup = self.enable_cleanup;
 
         if !evicted_snapshots.is_empty() && enable_cleanup {
-            self.spawn_cleanup_task(snapshot.partition_id, evicted_snapshots);
+            self.spawn_cleanup_task(snapshot.partition_id, evicted_snapshots, lease_guard);
         }
 
         PartitionSnapshotStatus::try_from(&new_latest)
@@ -562,10 +634,28 @@ impl SnapshotRepository {
         Ok((latest, evicted_snapshots))
     }
 
+    fn conditional_put_options(&self, version: Option<UpdateVersion>) -> PutOptions {
+        // The object_store file provider supports create-if-not-exists but not update-version on
+        // put. The file:// protocol is only be enabled in test because of this.
+        let use_conditional_update = !matches!(self.destination.scheme(), "file");
+
+        let mode = match (use_conditional_update, version) {
+            (true, Some(v)) if v.e_tag.is_some() || v.version.is_some() => PutMode::Update(v),
+            (false, _) => PutMode::Overwrite,
+            _ => PutMode::Create,
+        };
+
+        PutOptions {
+            mode,
+            ..PutOptions::default()
+        }
+    }
+
     fn spawn_cleanup_task(
         &self,
         partition_id: PartitionId,
         cleanup_snapshots: Vec<SnapshotReference>,
+        lease_guard: Arc<SnapshotLeaseGuard>,
     ) {
         let repository = self.clone();
         let task_name = format!("snapshot-cleanup-{}", partition_id);
@@ -575,23 +665,72 @@ impl SnapshotRepository {
             task_name,
             async move {
                 repository
-                    .cleanup_pending_deletions(partition_id, cleanup_snapshots)
+                    .cleanup_evicted_snapshots(partition_id, cleanup_snapshots, lease_guard)
                     .await;
                 Ok::<(), anyhow::Error>(())
             },
         );
     }
 
-    async fn cleanup_pending_deletions(
+    #[instrument(level = "debug", skip_all, fields(%partition_id))]
+    async fn cleanup_evicted_snapshots(
         &self,
         partition_id: PartitionId,
-        cleanup_snapshots: Vec<SnapshotReference>,
+        evicted_snapshots: Vec<SnapshotReference>,
+        lease_guard: Arc<SnapshotLeaseGuard>,
     ) {
-        for snapshot_ref in &cleanup_snapshots {
+        if !lease_guard.is_valid() {
+            debug!("Lease expired before cleanup, aborting");
+            return;
+        }
+
+        let result = lease_guard
+            .run_under_lease(self.cleanup_evicted_snapshots_inner(
+                partition_id,
+                evicted_snapshots,
+                &lease_guard,
+            ))
+            .await;
+
+        match result {
+            Some(Ok(())) => {
+                debug!("Cleanup completed successfully");
+            }
+            Some(Err(e)) => {
+                debug!(error = %e, "Cleanup failed");
+            }
+            None => {
+                warn!("Cleanup aborted due to lease loss");
+            }
+        }
+        // lease_guard dropped
+    }
+
+    async fn cleanup_evicted_snapshots_inner(
+        &self,
+        partition_id: PartitionId,
+        evicted_snapshots: Vec<SnapshotReference>,
+        lease_guard: &Arc<SnapshotLeaseGuard>,
+    ) -> anyhow::Result<()> {
+        if !lease_guard.is_valid() {
+            anyhow::bail!("Lease expired before cleanup could start");
+        }
+
+        for snapshot_ref in &evicted_snapshots {
+            if !lease_guard.is_valid() {
+                debug!(
+                    %partition_id,
+                    "Lease approaching deadline, aborting remaining cleanup"
+                );
+                break;
+            }
+
             // Errors are logged inside delete_snapshot_files; if cleanup fails,
             // these snapshots become orphans to be cleaned by future scan-sweep.
             self.delete_snapshot_files(partition_id, snapshot_ref).await;
         }
+
+        Ok(())
     }
 
     /// Best-effort deletion of snapshot files. Errors are logged but not propagated.
@@ -952,25 +1091,6 @@ impl SnapshotRepository {
     ) -> ObjectPath {
         self.base_prefix(snapshot_metadata).join(filename)
     }
-
-    fn conditional_put_options(&self, version: Option<&UpdateVersion>) -> PutOptions {
-        // The object_store file provider supports create-if-not-exists but not update-version on
-        // put. The file:// protocol is only be enabled in test because of this.
-        let use_conditional_update = !matches!(self.destination.scheme(), "file");
-
-        let mode = match (use_conditional_update, version) {
-            (true, Some(v)) if v.e_tag.is_some() || v.version.is_some() => {
-                PutMode::Update(v.clone())
-            }
-            (false, _) => PutMode::Overwrite,
-            _ => PutMode::Create,
-        };
-
-        PutOptions {
-            mode,
-            ..PutOptions::default()
-        }
-    }
 }
 
 // Strip the leading "/" character from RocksDB LiveFile names
@@ -1083,6 +1203,7 @@ async fn abort_tasks<T: 'static>(mut join_set: JoinSet<T>) {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{Duration, SystemTime};
 
     use ahash::HashSet;
@@ -1105,6 +1226,7 @@ mod tests {
     use restate_types::retries::RetryPolicy;
     use restate_types::sharding::KeyRange;
 
+    use crate::snapshots::SnapshotLeaseGuard;
     use crate::snapshots::repository::{LatestSnapshotVersion, SnapshotUploadProgress};
 
     use super::{LatestSnapshot, SnapshotReference, SnapshotRepository, UniqueSnapshotKey};
@@ -1112,7 +1234,7 @@ mod tests {
 
     #[restate_core::test]
     async fn overwrite_unparsable_latest() -> anyhow::Result<()> {
-        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let env = TestCoreEnv::create_with_single_node(1, 1).await;
 
         let snapshot_source = TempDir::new()?;
         let source_dir = snapshot_source.path().to_path_buf();
@@ -1138,9 +1260,13 @@ mod tests {
             ),
             ..SnapshotsOptions::default()
         };
-        let repository = SnapshotRepository::new_from_config(&opts, TempDir::new().unwrap().keep())
-            .await?
-            .unwrap();
+        let repository = SnapshotRepository::new_from_config(
+            &opts,
+            TempDir::new().unwrap().keep(),
+            env.metadata_store_client.clone(),
+        )
+        .await?
+        .unwrap();
 
         // Write invalid JSON to latest.json
         let latest_path = destination_dir
@@ -1152,7 +1278,12 @@ mod tests {
         latest.write_all(b"not valid json").await?;
         latest.shutdown().await?;
 
-        assert!(repository.put(&snapshot, source_dir).await.is_err());
+        assert!(
+            repository
+                .put(&snapshot, source_dir, Arc::new(SnapshotLeaseGuard::noop()))
+                .await
+                .is_err()
+        );
 
         Ok(())
     }
@@ -1178,7 +1309,7 @@ mod tests {
     }
 
     async fn test_put_snapshot(destination: String) -> anyhow::Result<()> {
-        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let env = TestCoreEnv::create_with_single_node(1, 1).await;
 
         let snapshot_source = TempDir::new()?;
         let source_dir = snapshot_source.path().to_path_buf();
@@ -1218,11 +1349,21 @@ mod tests {
             ..SnapshotsOptions::default()
         };
 
-        let repository = SnapshotRepository::new_from_config(&opts, TempDir::new().unwrap().keep())
-            .await?
-            .unwrap();
+        let repository = SnapshotRepository::new_from_config(
+            &opts,
+            TempDir::new().unwrap().keep(),
+            env.metadata_store_client.clone(),
+        )
+        .await?
+        .unwrap();
 
-        repository.put(&snapshot1, source_dir.clone()).await?;
+        repository
+            .put(
+                &snapshot1,
+                source_dir.clone(),
+                Arc::new(SnapshotLeaseGuard::noop()),
+            )
+            .await?;
 
         let partition_prefix =
             ObjectPath::from(destination_url.path()).join(snapshot1.partition_id.to_string());
@@ -1266,7 +1407,9 @@ mod tests {
         );
         snapshot2.min_applied_lsn = snapshot1.min_applied_lsn.next();
 
-        repository.put(&snapshot2, source_dir).await?;
+        repository
+            .put(&snapshot2, source_dir, Arc::new(SnapshotLeaseGuard::noop()))
+            .await?;
 
         let latest = object_store
             .get(&partition_prefix.join("latest.json"))
@@ -1346,7 +1489,7 @@ mod tests {
 
     #[restate_core::test]
     async fn snapshot_retention_v2() -> anyhow::Result<()> {
-        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let env = TestCoreEnv::create_with_single_node(1, 1).await;
 
         let snapshots_destination = TempDir::new()?;
         let destination = Url::from_file_path(snapshots_destination.path())
@@ -1359,9 +1502,13 @@ mod tests {
             ..SnapshotsOptions::default()
         };
 
-        let repository = SnapshotRepository::new_from_config(&opts, TempDir::new().unwrap().keep())
-            .await?
-            .unwrap();
+        let repository = SnapshotRepository::new_from_config(
+            &opts,
+            TempDir::new().unwrap().keep(),
+            env.metadata_store_client.clone(),
+        )
+        .await?
+        .unwrap();
 
         for i in 1..=4 {
             let snapshot_source = TempDir::new()?;
@@ -1379,7 +1526,9 @@ mod tests {
             );
             snapshot.min_applied_lsn = Lsn::new(i * 1000);
 
-            repository.put(&snapshot, source_dir).await?;
+            repository
+                .put(&snapshot, source_dir, Arc::new(SnapshotLeaseGuard::noop()))
+                .await?;
         }
 
         let latest_path = ObjectPath::from(Url::parse(&destination)?.path().to_string())
@@ -1407,7 +1556,7 @@ mod tests {
 
     #[restate_core::test]
     async fn v1_to_v2_migration() -> anyhow::Result<()> {
-        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let env = TestCoreEnv::create_with_single_node(1, 1).await;
 
         let snapshots_destination = TempDir::new()?;
         let destination = Url::from_file_path(snapshots_destination.path())
@@ -1441,9 +1590,13 @@ mod tests {
             ..SnapshotsOptions::default()
         };
 
-        let repository = SnapshotRepository::new_from_config(&opts, TempDir::new().unwrap().keep())
-            .await?
-            .unwrap();
+        let repository = SnapshotRepository::new_from_config(
+            &opts,
+            TempDir::new().unwrap().keep(),
+            env.metadata_store_client.clone(),
+        )
+        .await?
+        .unwrap();
 
         let mut progress =
             SnapshotUploadProgress::with_snapshot_path(repository.base_prefix(&snapshot));
@@ -1489,7 +1642,13 @@ mod tests {
         );
         snapshot_v2.min_applied_lsn = Lsn::new(2000);
 
-        repository.put(&snapshot_v2, source_dir_2).await?;
+        repository
+            .put(
+                &snapshot_v2,
+                source_dir_2,
+                Arc::new(SnapshotLeaseGuard::noop()),
+            )
+            .await?;
 
         let latest_data = object_store.get(&latest_path).await?;
         let latest: LatestSnapshot = serde_json::from_slice(&latest_data.bytes().await?)?;
@@ -1501,7 +1660,7 @@ mod tests {
 
     #[restate_core::test]
     async fn archived_lsn_v2() -> anyhow::Result<()> {
-        let _env = TestCoreEnv::create_with_single_node(1, 1).await;
+        let env = TestCoreEnv::create_with_single_node(1, 1).await;
 
         let snapshots_destination = TempDir::new()?;
         let destination = Url::from_file_path(snapshots_destination.path())
@@ -1514,9 +1673,13 @@ mod tests {
             ..SnapshotsOptions::default()
         };
 
-        let repository = SnapshotRepository::new_from_config(&opts, TempDir::new().unwrap().keep())
-            .await?
-            .unwrap();
+        let repository = SnapshotRepository::new_from_config(
+            &opts,
+            TempDir::new().unwrap().keep(),
+            env.metadata_store_client.clone(),
+        )
+        .await?
+        .unwrap();
 
         for i in 1..=3 {
             let snapshot_source = TempDir::new()?;
@@ -1534,7 +1697,9 @@ mod tests {
             );
             snapshot.min_applied_lsn = Lsn::new(i * 1000);
 
-            repository.put(&snapshot, source_dir).await?;
+            repository
+                .put(&snapshot, source_dir, Arc::new(SnapshotLeaseGuard::noop()))
+                .await?;
         }
 
         let status = repository
@@ -1551,6 +1716,7 @@ mod tests {
 
     #[restate_core::test]
     async fn cleanup() -> anyhow::Result<()> {
+        // Required for mock_snapshot's use of Metadata::with_current
         let _env = TestCoreEnv::create_with_single_node(1, 1).await;
 
         let snapshots_destination = TempDir::new()?;
@@ -1565,16 +1731,21 @@ mod tests {
             ..SnapshotsOptions::default()
         };
 
-        let repository = SnapshotRepository::new_from_config(&opts, TempDir::new().unwrap().keep())
-            .await?
-            .unwrap();
+        let repository = SnapshotRepository::new_from_config_with_stub_leases(
+            &opts,
+            TempDir::new().unwrap().keep(),
+        )
+        .await?
+        .unwrap();
 
         let mut all_snapshot_paths = Vec::new();
         for i in 1..=5 {
             let (snapshot, source_dir) =
                 mock_snapshot(format!("data-{}", i).as_bytes(), Lsn::new(100 * i)).await?;
             all_snapshot_paths.push(SnapshotReference::from_metadata(&snapshot).path);
-            repository.put(&snapshot, source_dir).await?;
+            repository
+                .put(&snapshot, source_dir, Arc::new(SnapshotLeaseGuard::noop()))
+                .await?;
         }
 
         let latest_path = repository.latest_snapshot_pointer_path(PartitionId::MIN);
