@@ -8057,6 +8057,7 @@ dependencies = [
  "pin-project",
  "prost",
  "rand 0.9.4",
+ "regex",
  "restate-clock",
  "restate-core",
  "restate-errors",
