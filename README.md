@@ -1,34 +1,33 @@
-[![Documentation](https://img.shields.io/badge/doc-reference-blue)](https://docs.restate.dev)
 [![Examples](https://img.shields.io/badge/view-examples-blue)](https://github.com/restatedev/examples)
 [![Discord](https://img.shields.io/discord/1128210118216007792?logo=discord)](https://discord.gg/skW3AZ6uGd)
 [![Slack](https://img.shields.io/badge/Slack-4A154B?logo=slack&logoColor=fff)](https://join.slack.com/t/restatecommunity/shared_invite/zt-2v9gl005c-WBpr167o5XJZI1l7HWKImA)
-[![Twitter](https://img.shields.io/twitter/follow/restatedev.svg?style=social&label=Follow)](https://x.com/intent/follow?screen_name=restatedev)
+[![Twitter](https://img.shields.io/twitter/follow/restatedev.svg?style=social&label=Follow)](https://x.com/midwest_sean419)
 
 # Restate - Building resilient applications made easy!
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://restate.dev/use-cases-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://restate.dev/use-cases-light.png">
-    <img alt="Restate overview" src="https://restate.dev/use-cases-light.png" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="
+    <source media="(prefers-color-scheme: light)" srcset="
+    <img alt="Restate overview" src=" width="100%">
   </picture>
 </p>
 
-[Restate](https://restate.dev) is the simplest way to build resilient applications.
+Restate is the simplest way to build resilient applications.
 
 Restate provides a distributed durable version of your everyday building blocks, letting you build a wide range of use cases:
 
 * [Durable AI Agents](https://github.com/restatedev/ai-examples)
-* [Workflows-as-Code](https://docs.restate.dev/use-cases/workflows)
-* [Microservice Orchestration](https://docs.restate.dev/use-cases/microservice-orchestration)
-* [Event Processing](https://docs.restate.dev/use-cases/event-processing)
-* [Async Tasks](https://docs.restate.dev/use-cases/async-tasks)
+* Workflows-as-Code
+* Microservice Orchestration
+* Event Processing
+* Async Tasks
 * [Agents, Stateful Actors, state machines, and much more](https://github.com/restatedev/examples)
 
 ## Get started with Restate
 
-1. 🏎 [Follow the Quickstart](https://docs.restate.dev/get_started/quickstart) to get Restate up and running within 2 minutes!
-1. 💡 [The Tour of Restate](https://docs.restate.dev/get_started/tour) walks you through the most important features of Restate.
+1. 🏎 Follow the Quickstart to get Restate up and running within 2 minutes!
+1. 💡 The Tour of Restate walks you through the most important features of Restate.
 
 ## SDKs
 
@@ -44,7 +43,7 @@ Restate supports the following SDKs:
 
 We offer pre-built binaries of the CLI and the server for MacOS and Linux.
 
-Have a look at the [Quickstart](https://docs.restate.dev/get_started/quickstart) or [installation instructions in the docs](https://docs.restate.dev/develop/local_dev). 
+Have a look at the Quickstart or installation instructions in the docs. 
 
 ### Install the server
 
@@ -81,13 +80,13 @@ Run via npx:
 npx @restatedev/restate
 ```
 
-You can also download the binaries from the [release page](https://github.com/restatedev/restate/releases) or our [download page](https://restate.dev/get-restate/).
+You can also download the binaries from the [release page](https://github.com/restatedev/restate/releases) or our download page.
 
 ## Community
 
 * 🤗️ Join our online community on [Discord](https://discord.gg/skW3AZ6uGd) or [Slack](https://join.slack.com/t/restatecommunity/shared_invite/zt-2v9gl005c-WBpr167o5XJZI1l7HWKImA) for help, sharing feedback and talking to the community.
-* 📖 [Check out our documentation](https://docs.restate.dev) to get started quickly!
-* 📣 [Follow us on Twitter](https://twitter.com/restatedev) for staying up to date.
+* 📖 Check out our documentation to get started quickly!
+* 📣 [Follow us on Twitter](https://x.com/midwest_sean419) for staying up to date.
 * 🙋 [Create a GitHub issue](https://github.com/restatedev/restate/issues) for requesting a new feature or reporting a problem.
 * 🏠 [Visit our GitHub org](https://github.com/restatedev) for exploring other repositories.
 
@@ -95,12 +94,12 @@ You can also download the binaries from the [release page](https://github.com/re
 
 The basic primitives Restate offers to simplify application development are the following:
 
-* **Reliable Execution**: Restate guarantees code runs to completion. Failures result in retries that use the [Durable Execution mechanism](https://docs.restate.dev/concepts/durable_execution) to recover partial progress and prevent re-executing completed steps.
-* **Reliable Communication**: Services communicate with exactly-once semantics: whether it's [request-response, one-way messages, or scheduled tasks](https://docs.restate.dev/concepts/invocations). Restate reliably delivers messages and uses Durable Execution to ensure no losses or duplicates can happen.
+* **Reliable Execution**: Restate guarantees code runs to completion. Failures result in retries that use the Durable Execution mechanism to recover partial progress and prevent re-executing completed steps.
+* **Reliable Communication**: Services communicate with exactly-once semantics: whether it's request-response, one-way messages, or scheduled tasks. Restate reliably delivers messages and uses Durable Execution to ensure no losses or duplicates can happen.
 * **Durable Promises and Timers**: Register Promises/Futures and timers in Restate to make them resilient to failures (e.g. sleep, webhooks, timers). Restate can recover them across failures, processes, and time.
-* **Consistent State**: Implement [stateful entities](https://docs.restate.dev/concepts/services) with isolated K/V state per entity. Restate persists the K/V state updates together with the execution progress to ensure consistent state. Restate attaches the K/V state to the request on invocation, and writes it back upon completion. This is particularly efficient for FaaS deployments (stateful serverless, yay!).
+* **Consistent State**: Implement stateful entities with isolated K/V state per entity. Restate persists the K/V state updates together with the execution progress to ensure consistent state. Restate attaches the K/V state to the request on invocation, and writes it back upon completion. This is particularly efficient for FaaS deployments (stateful serverless, yay!).
 * **Suspending User Code**: long-running code suspends when awaiting on a Promise/Future and resumes when that promise is resolved. This is particularly useful in combination with serverless deployments.
-* **Observability & Introspection**: Restate includes a UI and CLI to inspect the [state of your application](https://docs.restate.dev/operate/introspection) across services and invocations. Restate automatically generates Open Telemetry traces for the interactions between handlers.
+* **Observability & Introspection**: Restate includes a UI and CLI to inspect the state of your application across services and invocations. Restate automatically generates Open Telemetry traces for the interactions between handlers.
 
 ## Contributing
 
